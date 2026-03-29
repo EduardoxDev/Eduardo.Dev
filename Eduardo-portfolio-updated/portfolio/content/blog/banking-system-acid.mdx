@@ -1,0 +1,109 @@
+---
+title: "O que aprendi construindo um sistema bancário do zero"
+description: "Transações ACID, double-entry bookkeeping e idempotência — o que ninguém te conta sobre sistemas financeiros até você errar em produção."
+date: "2026-02-20"
+tags: ["java", "postgresql", "arquitetura", "backend"]
+cover: "https://images.unsplash.com/photo-1563013544-824ae1b704d3?w=1200&q=80"
+---
+
+# O que aprendi construindo um sistema bancário do zero
+
+O [Digital Banking System](https://github.com/EduardoxDev/Digital-Banking-System) começou como estudo. Virou uma das coisas mais desafiadoras que já construí — não pela complexidade técnica, mas pelas garantias que sistemas financeiros exigem.
+
+Dinheiro não tolera bugs silenciosos.
+
+## Regra número um: double-entry bookkeeping
+
+Todo sistema financeiro sério usa contabilidade de partidas dobradas. Para cada débito, existe um crédito de mesmo valor. O saldo de todas as contas somado deve ser sempre zero.
+
+```sql
+CREATE TABLE ledger_entries (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    account_id  UUID NOT NULL REFERENCES accounts(id),
+    amount      BIGINT NOT NULL,
+    direction   VARCHAR(6) NOT NULL CHECK (direction IN ('DEBIT', 'CREDIT')),
+    txn_id      UUID NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+```
+
+Note o `BIGINT`. **Nunca use FLOAT para dinheiro.** `0.1 + 0.2 ≠ 0.3` em ponto flutuante. Armazene centavos como inteiros.
+
+## ACID na prática
+
+Uma transferência entre contas precisa ser atômica. Se debita da origem mas não credita no destino — o dinheiro sumiu:
+
+```java
+@Transactional(isolation = Isolation.SERIALIZABLE)
+public TransactionResult transfer(TransferCommand cmd) {
+    Account source = accountRepository.findByIdForUpdate(cmd.sourceId())
+        .orElseThrow(() -> new AccountNotFoundException(cmd.sourceId()));
+
+    Account destination = accountRepository.findByIdForUpdate(cmd.destinationId())
+        .orElseThrow(() -> new AccountNotFoundException(cmd.destinationId()));
+
+    if (source.getBalance() < cmd.amount()) {
+        throw new InsufficientFundsException(source.getId(), cmd.amount());
+    }
+
+    source.debit(cmd.amount());
+    destination.credit(cmd.amount());
+    ledgerService.recordTransfer(source, destination, cmd.amount(), cmd.transactionId());
+
+    accountRepository.save(source);
+    accountRepository.save(destination);
+
+    return TransactionResult.success(cmd.transactionId());
+}
+```
+
+`Isolation.SERIALIZABLE` é essencial. Com `READ_COMMITTED` (padrão), dois saques simultâneos passam na verificação de saldo e deixam a conta negativa.
+
+## Idempotência: o problema que não vi vir
+
+Usuário faz uma transferência. Conexão cai antes de receber resposta. Ele tenta de novo. A transferência deve acontecer **uma vez**, não duas.
+
+```java
+@Transactional
+public TransactionResult createTransaction(CreateTransactionRequest req) {
+    return transactionRepository
+        .findByIdempotencyKey(req.idempotencyKey())
+        .map(TransactionResult::fromExisting)
+        .orElseGet(() -> executeNewTransaction(req));
+}
+```
+
+Mas há um race condition: dois requests com a mesma chave chegam simultaneamente. Ambos passam pelo `findByIdempotencyKey` antes de qualquer um inserir.
+
+Solução no banco:
+
+```sql
+ALTER TABLE transactions
+ADD CONSTRAINT uq_idempotency_key UNIQUE (idempotency_key);
+```
+
+A constraint garante que só um insert passa. O segundo recebe exceção de unicidade — tratada retornando o resultado existente.
+
+## Auditoria total
+
+Nunca deleto ou atualizo saldos diretamente. Só insiro entradas no ledger. O saldo atual é calculado:
+
+```sql
+SELECT
+    COALESCE(SUM(
+        CASE
+            WHEN direction = 'CREDIT' THEN amount
+            WHEN direction = 'DEBIT'  THEN -amount
+        END
+    ), 0) AS current_balance
+FROM ledger_entries
+WHERE account_id = $1;
+```
+
+Isso significa reconstruir o histórico completo de qualquer conta em qualquer momento.
+
+## O que faria diferente
+
+Usaria **event sourcing** desde o início. O ledger append-only já é meio caminho — mas formalizar eventos de domínio (MoneyTransferred, AccountDebited) como cidadãos de primeira classe torna o sistema mais auditável e mais fácil de integrar.
+
+O mais valioso que aprendi: sistemas financeiros não toleram "quase correto".

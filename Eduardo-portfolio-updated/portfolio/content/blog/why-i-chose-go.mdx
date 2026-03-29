@@ -1,0 +1,84 @@
+---
+title: "Por que escolhi Go para construir a infraestrutura da Stackr"
+description: "Depois de anos com Java e C++, migrei o core da Stackr Hosting para Go. Aqui está o porquê — e o que aprendi no processo."
+date: "2026-03-05"
+tags: ["go", "backend", "stackr", "infraestrutura"]
+cover: "https://images.unsplash.com/photo-1555066931-4365d14bab8c?w=1200&q=80"
+---
+
+# Por que escolhi Go para construir a infraestrutura da Stackr
+
+Quando comecei a Stackr Hosting, a primeira decisão técnica importante foi: qual linguagem usaria para o core do sistema?
+
+Eu tinha experiência real com Java e C++. Ambas funcionariam. Mas escolhi Go — e essa decisão moldou tudo.
+
+## O problema concreto
+
+A Stackr é uma plataforma de hospedagem. Isso significa:
+
+- Provisionar containers em milissegundos
+- Gerenciar centenas de conexões simultâneas
+- Monitorar métricas em tempo real de dezenas de servidores
+- Zero downtime — disponibilidade *é* o produto
+
+Java resolve isso. C++ também. Mas Go resolve de um jeito que faz sentido para um time pequeno.
+
+## Goroutines mudam o jogo
+
+Em Java, cada thread custa ~1MB de stack. Com 10.000 conexões, são 10GB só em threads.
+
+Goroutine começa com 2KB. O runtime ajusta automaticamente.
+
+```go
+func (s *Server) handleConnections(ln net.Listener) {
+    for {
+        conn, err := ln.Accept()
+        if err != nil {
+            s.logger.Error("accept failed", "err", err)
+            continue
+        }
+        go s.handleClient(conn)
+    }
+}
+```
+
+Isso não é pseudocódigo — é o código real de produção da Stackr. Cada cliente recebe uma goroutine. O scheduler cuida do resto.
+
+## Deploy trivial
+
+Um binário estático. Sem JVM. Sem dependências.
+
+```dockerfile
+FROM golang:1.22-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o stackr-api ./cmd/api
+
+FROM scratch
+COPY --from=builder /app/stackr-api /stackr-api
+ENTRYPOINT ["/stackr-api"]
+```
+
+Imagem Docker final: **8MB**. Imagem Spring Boot: 300MB+. Em um sistema que faz deploy dezenas de vezes por dia, isso importa.
+
+## GC previsível
+
+Java tem um GC excelente mas que surpreende em picos. Go foi projetado para latência baixa. Pausas de sub-milissegundo são a norma.
+
+Para uma plataforma onde clientes monitoram latência ativamente, isso é importante.
+
+## Números reais
+
+Depois de migrar o core de provisionamento:
+
+- Tempo de provisionamento: **4.2s → 0.8s**
+- Uso de memória: **1.2GB → 180MB** sob mesma carga
+- P99 de latência: **340ms → 22ms**
+
+## O que Java ainda faz melhor
+
+Ser honesto importa. Ainda uso Spring Boot para o painel admin interno da Stackr. Ecossistema de bibliotecas enterprise, JPA, tooling de profiling — Java vence nessas frentes.
+
+A lição: escolha a linguagem certa para o problema. Go foi certa para infraestrutura de hosting em escala com time pequeno.
+
+Não seria certa para todo problema.
