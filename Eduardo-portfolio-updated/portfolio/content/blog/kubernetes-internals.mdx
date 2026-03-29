@@ -1,0 +1,116 @@
+---
+title: "Kubernetes Internals: How the Control Plane Actually Works"
+description: "A deep dive into etcd, the API server, the scheduler, and the kubelet — understanding what happens between kubectl apply and a running pod."
+date: "2026-02-28"
+tags: ["kubernetes", "infrastructure", "distributed-systems"]
+cover: "https://images.unsplash.com/photo-1639322537228-f710d846310a?w=1200&q=80"
+---
+
+# Kubernetes Internals: How the Control Plane Actually Works
+
+Running Kubernetes is one thing. Understanding what happens between `kubectl apply -f pod.yaml` and a running container is another. This post is about the second thing.
+
+## The Big Picture
+
+```
+kubectl → API Server → etcd
+                    ↓
+              Scheduler → API Server → etcd
+                                    ↓
+                              Kubelet → Container Runtime
+```
+
+Five components make a Kubernetes cluster work:
+
+1. **etcd** — the source of truth, a distributed key-value store
+2. **API Server** — the single entry point for all cluster state changes
+3. **Scheduler** — decides which node a pod runs on
+4. **Controller Manager** — reconciles desired state with actual state
+5. **Kubelet** — runs on every node, makes pods actually happen
+
+## etcd: The Source of Truth
+
+Everything in Kubernetes lives in etcd. Every pod spec, every service, every config map — stored as key-value pairs under paths like `/registry/pods/default/my-pod`.
+
+The API Server is the *only* component that talks to etcd directly. Everyone else talks to the API Server.
+
+```bash
+etcdctl get /registry/pods/default/my-pod --print-value-only | protoc --decode_raw
+```
+
+etcd uses the Raft consensus algorithm. With 3 nodes, the cluster tolerates 1 failure. With 5 nodes, it tolerates 2. This is why production clusters run etcd on an odd number of nodes.
+
+## The API Server: Watches and Optimistic Concurrency
+
+The API Server does more than route requests. Two mechanisms make the whole system work:
+
+**Watch API** — instead of polling, components watch for changes:
+
+```go
+watcher, err := clientset.CoreV1().Pods("default").Watch(ctx, metav1.ListOptions{})
+for event := range watcher.ResultChan() {
+    switch event.Type {
+    case watch.Added:
+        pod := event.Object.(*v1.Pod)
+        fmt.Printf("Pod added: %s\n", pod.Name)
+    case watch.Modified:
+        fmt.Printf("Pod modified\n")
+    case watch.Deleted:
+        fmt.Printf("Pod deleted\n")
+    }
+}
+```
+
+**ResourceVersion + Optimistic Concurrency** — every object has a `resourceVersion`. Updates must include the current version. If two controllers update simultaneously, one will get a conflict error and must retry. No distributed locks needed.
+
+## The Scheduler: Filter and Score
+
+When a pod has no `nodeName`, the Scheduler picks one in two phases:
+
+**Filter** — eliminate nodes that can't run the pod:
+- Not enough CPU or memory
+- Node has a taint the pod doesn't tolerate
+- Pod has a nodeSelector that doesn't match
+
+**Score** — rank remaining nodes:
+- `LeastRequestedPriority` — prefer nodes with more free resources
+- `BalancedResourceAllocation` — balance CPU vs memory usage
+- `ImageLocalityPriority` — prefer nodes that already have the image
+
+The highest-scoring node wins. The Scheduler writes `nodeName` to the pod spec in etcd. That's it — the Scheduler's job is done.
+
+## The Kubelet: Making It Real
+
+The Kubelet runs on every node and watches for pods assigned to its node. When it sees one:
+
+1. Pulls the container image (if not cached)
+2. Creates the pod sandbox (network namespace, pause container)
+3. Starts each container via the Container Runtime Interface (CRI)
+4. Watches container health via liveness probes
+5. Reports pod status back to the API Server
+
+The Kubelet talks to the container runtime (containerd, CRI-O) via gRPC:
+
+```protobuf
+service RuntimeService {
+    rpc RunPodSandbox(RunPodSandboxRequest) returns (RunPodSandboxResponse);
+    rpc CreateContainer(CreateContainerRequest) returns (CreateContainerResponse);
+    rpc StartContainer(StartContainerRequest) returns (StartContainerResponse);
+    rpc StopContainer(StopContainerRequest) returns (StopContainerResponse);
+}
+```
+
+## The Reconciliation Loop
+
+Every controller in Kubernetes runs a reconciliation loop:
+
+```
+observe actual state
+compare to desired state
+take action to close the gap
+repeat
+```
+
+This is why Kubernetes is self-healing. If you delete a pod managed by a Deployment, the ReplicaSet controller sees actual replicas (2) < desired replicas (3) and creates a new pod. No saga, no event sourcing — just a loop comparing state.
+
+Understanding this loop is the key to understanding every Kubernetes primitive: Deployments, StatefulSets, DaemonSets, and custom operators all follow the same pattern.
