@@ -1,0 +1,113 @@
+---
+title: "Designing an API Gateway: Routing, Auth, and Rate Limiting"
+description: "A walkthrough of the key decisions behind building a production-inspired API gateway — from reverse proxying to JWT validation and sliding window rate limiting."
+date: "2026-01-22"
+tags: ["backend", "go", "architecture"]
+cover: "https://images.unsplash.com/photo-1558494949-ef010cbdcc31?w=1200&q=80"
+---
+
+# Designing an API Gateway: Routing, Auth, and Rate Limiting
+
+An API Gateway is one of those components that every distributed system eventually needs — and one of the best ways to understand microservice architecture is to build one yourself.
+
+My [API Gateway project](https://github.com/EduardoxDev/Api-Gateway) implements three core concerns: **routing**, **authentication**, and **rate limiting**.
+
+## The Core Abstraction: Middleware Chain
+
+```go
+type Middleware func(http.Handler) http.Handler
+
+func Chain(h http.Handler, middlewares ...Middleware) http.Handler {
+    for i := len(middlewares) - 1; i >= 0; i-- {
+        h = middlewares[i](h)
+    }
+    return h
+}
+
+handler := Chain(
+    proxyHandler,
+    RateLimitMiddleware(limiter),
+    AuthMiddleware(jwtSecret),
+    LoggingMiddleware(logger),
+)
+```
+
+## Dynamic Reverse Proxy
+
+```go
+type Route struct {
+    Path        string `yaml:"path"`
+    Upstream    string `yaml:"upstream"`
+    StripPrefix bool   `yaml:"strip_prefix"`
+}
+
+func NewRouter(routes []Route) *Router {
+    mux := http.NewServeMux()
+    for _, r := range routes {
+        upstream, _ := url.Parse(r.Upstream)
+        proxy := httputil.NewSingleHostReverseProxy(upstream)
+
+        mux.HandleFunc(r.Path, func(w http.ResponseWriter, req *http.Request) {
+            if r.StripPrefix {
+                req.URL.Path = strings.TrimPrefix(req.URL.Path, r.Path)
+            }
+            proxy.ServeHTTP(w, req)
+        })
+    }
+    return &Router{mux: mux}
+}
+```
+
+## JWT Authentication
+
+```go
+func AuthMiddleware(secret []byte) Middleware {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            auth := r.Header.Get("Authorization")
+            if !strings.HasPrefix(auth, "Bearer ") {
+                http.Error(w, "unauthorized", http.StatusUnauthorized)
+                return
+            }
+
+            tokenStr := strings.TrimPrefix(auth, "Bearer ")
+            claims, err := validateJWT(tokenStr, secret)
+            if err != nil {
+                http.Error(w, "invalid token", http.StatusUnauthorized)
+                return
+            }
+
+            ctx := context.WithValue(r.Context(), claimsKey, claims)
+            next.ServeHTTP(w, r.WithContext(ctx))
+        })
+    }
+}
+```
+
+## Rate Limiting with Redis + Lua
+
+```go
+var rateLimitScript = redis.NewScript(`
+local key = KEYS[1]
+local limit = tonumber(ARGV[1])
+local window = tonumber(ARGV[2])
+local count = redis.call("INCR", key)
+if count == 1 then
+    redis.call("EXPIRE", key, window)
+end
+if count > limit then
+    return 0
+end
+return 1
+`)
+```
+
+## Key Lessons
+
+**Fail open on infrastructure failures.** If Redis goes down, allowing all requests is almost always the right call over denying all traffic.
+
+**Observability from day one.** Every middleware emits metrics — request count, latency histograms, error rates via Prometheus.
+
+**Config hot-reloading is harder than it looks.** Swapping routes requires careful synchronization while in-flight requests complete.
+
+Full source at [github.com/EduardoxDev/Api-Gateway](https://github.com/EduardoxDev/Api-Gateway).

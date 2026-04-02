@@ -1,0 +1,103 @@
+---
+title: "Linux Namespaces: o que acontece quando você digita docker run"
+description: "Uma investigação nível syscall do que o Docker faz por baixo dos panos — namespaces, cgroups e pivot_root explicados com código real."
+date: "2026-02-15"
+tags: ["linux", "containers", "go", "sistemas"]
+cover: "https://images.unsplash.com/photo-1629654297299-c8506221ca97?w=1200&q=80"
+---
+
+# Linux Namespaces: o que acontece quando você digita docker run
+
+Há dois tipos de engenheiros que usam Docker: os que tratam como mágica, e os que entendem o que acontece por baixo.
+
+Depois de construir o [Mini Runtime Container](https://github.com/EduardoxDev/Mini-Runtime-Container), entro na segunda categoria.
+
+## Um container é só um processo
+
+Essa é a verdade mais importante sobre containers: não existe virtualização de hardware. Um container é um processo Linux normal — com visibilidade restrita pelo kernel.
+
+Três primitivas fazem isso funcionar:
+
+1. **Namespaces** — limitam o que o processo *vê*
+2. **cgroups** — limitam o que o processo *usa*
+3. **pivot_root** — dão ao processo seu próprio sistema de arquivos
+
+## Namespaces em código
+
+```go
+cmd := exec.Command(args[0], args[1:]...)
+cmd.SysProcAttr = &syscall.SysProcAttr{
+    Cloneflags: syscall.CLONE_NEWUTS |  // hostname isolado
+                syscall.CLONE_NEWPID |  // PID namespace próprio
+                syscall.CLONE_NEWNS  |  // mount namespace
+                syscall.CLONE_NEWNET,   // rede isolada
+}
+```
+
+Com `CLONE_NEWPID`, o container pensa que é o PID 1. Mata ele, o kernel limpa todos os filhos automaticamente — igual a qualquer init system.
+
+## Verificando o isolamento
+
+```bash
+# Fora do container
+$ ps aux | wc -l
+142
+
+# Dentro do container
+$ ps aux | wc -l
+3
+```
+
+O processo dentro vê apenas ele mesmo e seus filhos. Não vê os 142 processos do host.
+
+## Configurando o filesystem raiz
+
+```go
+func pivotRoot(newRoot string) error {
+    if err := syscall.Mount(newRoot, newRoot, "", syscall.MS_BIND|syscall.MS_REC, ""); err != nil {
+        return fmt.Errorf("bind mount: %w", err)
+    }
+
+    putOld := filepath.Join(newRoot, ".put_old")
+    if err := os.MkdirAll(putOld, 0700); err != nil {
+        return err
+    }
+
+    if err := syscall.PivotRoot(newRoot, putOld); err != nil {
+        return fmt.Errorf("pivot_root: %w", err)
+    }
+
+    os.Chdir("/")
+    syscall.Unmount("/.put_old", syscall.MNT_DETACH)
+    return os.Remove("/.put_old")
+}
+```
+
+Depois disso, o container enxerga o `newRoot` como seu `/`. Não tem acesso ao sistema de arquivos real do host.
+
+## Limitando recursos com cgroups v2
+
+```go
+func createCgroup(name string, memLimitMB int) error {
+    cgPath := filepath.Join("/sys/fs/cgroup", name)
+    os.MkdirAll(cgPath, 0755)
+
+    memLimit := fmt.Sprintf("%d", memLimitMB*1024*1024)
+    os.WriteFile(filepath.Join(cgPath, "memory.max"), []byte(memLimit), 0644)
+
+    pid := fmt.Sprintf("%d", os.Getpid())
+    return os.WriteFile(filepath.Join(cgPath, "cgroup.procs"), []byte(pid), 0644)
+}
+```
+
+Com isso, o container não pode usar mais memória que o limite definido. Tentativa de ultrapassar = OOM killer.
+
+## O que passei dois dias debugando
+
+**pivot_root exige propagação de mount específica.** Se o mount do newRoot não for `MS_BIND`, a syscall retorna `EINVAL` sem mensagem útil.
+
+**cgroups v1 vs v2 são completamente diferentes.** 90% dos tutoriais usam v1. Sistemas modernos (Ubuntu 22+, Fedora 33+) usam v2. As APIs são incompatíveis.
+
+**Rede em namespaces exige veth pairs.** Para o container ter acesso à rede real, você precisa criar um par de interfaces virtuais, uma no namespace do container e outra no host, com bridge conectando as duas. É um projeto separado.
+
+O runtime completo tem ~400 linhas de Go. Faz algo genuinamente interessante. E depois de construí-lo, o Docker nunca mais foi mágica.
