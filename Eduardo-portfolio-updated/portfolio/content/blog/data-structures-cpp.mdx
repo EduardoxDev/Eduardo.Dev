@@ -1,0 +1,124 @@
+---
+title: "Implementando estruturas de dados do zero em C++ — e por que vale a pena"
+description: "Linked lists, árvores BST, heaps e grafos implementados manualmente. Por que um engenheiro moderno deveria se importar com ponteiros e gerenciamento manual de memória?"
+date: "2026-01-10"
+tags: ["c++", "algoritmos", "estruturas-de-dados", "fundamentos"]
+cover: "https://images.unsplash.com/photo-1509228468518-180dd4864904?w=1200&q=80"
+---
+
+# Implementando estruturas de dados do zero em C++ — e por que vale a pena
+
+Todo semestre, algum colega me pergunta por que perco tempo implementando linked lists em C++ quando existe `std::list`. Ou árvores BST quando existe `std::map`.
+
+A resposta é simples: porque implementar te força a entender.
+
+## O que você aprende implementando, não usando
+
+Quando você usa `std::map`, sabe que é O(log n) para inserção e busca. Quando você implementa uma árvore vermelho-preta, entende *por que* — e quando um hash map seria O(1) amortizado mas com pior caso pior.
+
+Essa distinção importa quando você está escolhendo estruturas de dados em código que vai rodar em produção.
+
+## Binary Search Tree em C++
+
+```cpp
+template<typename T>
+class BST {
+private:
+    struct Node {
+        T value;
+        Node* left  = nullptr;
+        Node* right = nullptr;
+        explicit Node(const T& v) : value(v) {}
+    };
+
+    Node* root = nullptr;
+
+    Node* insert(Node* node, const T& value) {
+        if (!node) return new Node(value);
+        if (value < node->value)
+            node->left = insert(node->left, value);
+        else if (value > node->value)
+            node->right = insert(node->right, value);
+        return node;
+    }
+
+    Node* findMin(Node* node) {
+        while (node->left) node = node->left;
+        return node;
+    }
+
+    Node* remove(Node* node, const T& value) {
+        if (!node) return nullptr;
+
+        if (value < node->value) {
+            node->left = remove(node->left, value);
+        } else if (value > node->value) {
+            node->right = remove(node->right, value);
+        } else {
+            if (!node->left) {
+                Node* right = node->right;
+                delete node;
+                return right;
+            }
+            if (!node->right) {
+                Node* left = node->left;
+                delete node;
+                return left;
+            }
+
+            Node* successor = findMin(node->right);
+            node->value = successor->value;
+            node->right = remove(node->right, successor->value);
+        }
+        return node;
+    }
+
+    void destroy(Node* node) {
+        if (!node) return;
+        destroy(node->left);
+        destroy(node->right);
+        delete node;
+    }
+
+public:
+    void insert(const T& value) { root = insert(root, value); }
+    void remove(const T& value) { root = remove(root, value); }
+    ~BST() { destroy(root); }
+};
+```
+
+O caso do nó com dois filhos é onde a maioria dos tutoriais erra. Você não troca ponteiros — você copia o valor do sucessor in-order e remove o sucessor. Isso preserva a estrutura da árvore.
+
+## Gerenciamento de memória: o que linguagens modernas escondem
+
+Em Go, Java, Python — o GC cuida de tudo. Em C++, cada `new` exige um `delete` correspondente. Erro? Memory leak.
+
+```cpp
+void riskyFunction() {
+    Node* n = new Node(42);
+    doSomethingThatMightThrow();
+    delete n;  // nunca chega aqui se a função acima lançar exceção
+}
+
+void safeFunction() {
+    auto n = std::make_unique<Node>(42);
+    doSomethingThatMightThrow();
+    // n é destruído automaticamente aqui, mesmo com exceção
+}
+```
+
+Implementar estruturas com raw pointers — e depois refatorar para smart pointers — te ensina o que RAII significa de verdade. E te faz apreciar muito mais os GCs de Go e Java.
+
+## Por que isso importa em 2026
+
+Frameworks abstraem muito. Mas abstrações vazam.
+
+Quando o PostgreSQL escolhe um Seq Scan em vez de um Index Scan, você precisa entender o que é uma B-tree e por que o planner toma essa decisão.
+
+Quando seu serviço Go tem alta latência de GC, entender como listas encadeadas e fragmentação de heap funcionam te dá vocabulário para debugar.
+
+Quando você precisa escolher entre um heap e uma fila de prioridade para um scheduler, a diferença não é teórica.
+
+Os fundamentos não ficam obsoletos. As frameworks sim.
+
+Todo o código está no repositório [Data-Structures-Exercise](https://github.com/EduardoxDev/Data-Structures-Exercise) — BST, linked list, stack, queue, heap, e grafo com BFS/DFS. Em C++ e Java, para comparar as idiomáticas de cada linguagem.
